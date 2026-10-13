@@ -2,3 +2,7 @@ node_modules/
 *.tgz
 *.log
 .DS_Store
+
+# 内部施工文档（不公开）
+摸清报告.md
+设计方案.md
