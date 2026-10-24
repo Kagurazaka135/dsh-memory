@@ -5,9 +5,9 @@
  * 铁律：只追加不删；模型一律走本地 broker（假 key `local-broker`，代码零真 key）；
  *      定时归 host、插件只注册不自持（不用 setInterval）。
  */
-import type { Context } from '@deepseek-ai/cordis';
 import { type MemoryConfig } from './config.ts';
+import { type ContextLike } from './host.ts';
 export declare const name = "dsh-memory";
 /** 硬依赖：没有 tools 服务就什么也注册不了。其余（sessions/schedule/sessionQuery/sessionPersistence）都是可选能力。 */
 export declare const inject: string[];
-export declare function apply(ctx: Context, config?: Partial<MemoryConfig>): void;
+export declare function apply(ctx: ContextLike, config?: Partial<MemoryConfig>): void;

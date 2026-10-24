@@ -8,7 +8,7 @@
  *   memory_promote   把候选升格为 L3（人工确认后调）
  *   memory_organize  立刻跑一次夜间整理（schedule 到点提示的就是它；dry_run 只报告不落盘）
  */
-import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { defineTool, type ToolRunContext } from './define-tool.ts'
 import type { MemoryConfig } from './config.ts'
 import { localDate, runOrganize } from './organize.ts'
 import {

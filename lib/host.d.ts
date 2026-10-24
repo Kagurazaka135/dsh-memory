@@ -5,6 +5,18 @@
  * 只按服务名取用 —— 同一份包要能在 PC / 手机、0.1.x / 0.2.x 各版本宿主上加载。
  * 用到的字段全部可选化处理：服务形态对不上时按 undefined 处理，绝不抛。
  */
+/**
+ * 宿主 `Context` 的最小结构化类型（替代 `@deepseek-ai/cordis` 的类型 import）。
+ *
+ * 运行时 Cordis Context 还带 `inject` / `get` / 各服务属性；这里只声明本插件用到的部分，
+ * 其余按 `unknown` 索引读取（见 {@link serviceOf}）。这样 `lib/*.d.ts` 里不含任何
+ * `@deepseek-ai` 的 import，插件成为真正的零运行时依赖包。
+ */
+export interface ContextLike {
+    get?(key: string): unknown;
+    inject(names: string[], callback: (ctx: ContextLike) => unknown): unknown;
+    [key: string]: unknown;
+}
 export interface SessionHeaderLike {
     id: string;
     createdAt?: number;

@@ -22,8 +22,8 @@
  * - **降级**：宿主没有 sessions/schedule/sessionPersistence 服务（如 dsh 0.1.x）时什么都不做，
  *   记忆工具照常可用。
  */
-import type { Context } from '@deepseek-ai/cordis';
 import type { MemoryConfig } from './config.ts';
+import { type ContextLike } from './host.ts';
 export declare const SCHEDULE_TITLE = "\u8BB0\u5FC6\u6574\u7406\uFF08dsh-memory\u00B7\u591C\u95F4\uFF09";
 export declare const PROMPT_MARKER = "\u3010dsh-memory \u591C\u95F4\u6574\u7406\u3011";
 export declare const DEFAULT_ORGANIZER_SESSION = "memory-organizer";
@@ -38,12 +38,12 @@ export interface SetupResult {
     detail?: string;
 }
 /** 幂等注册每日整理任务。可重复调用（重复 = no-op）。 */
-export declare function setupNightlyOrganize(ctx: Context, config: MemoryConfig): Promise<SetupResult>;
+export declare function setupNightlyOrganize(ctx: ContextLike, config: MemoryConfig): Promise<SetupResult>;
 /**
  * 显式停用（`enable_schedule: false`）时清理自己注册的夜间整理任务。
  * 只删本插件自己的任务（会话 + 标题/prompt 标记双重匹配），绝不碰别人的任务。返回删除条数。
  */
-export declare function cleanupNightlyOrganize(ctx: Context, config: MemoryConfig): Promise<number>;
+export declare function cleanupNightlyOrganize(ctx: ContextLike, config: MemoryConfig): Promise<number>;
 /** 当前已注册任务（供自检工具/日志用）。 */
 export declare function registeredTask(): Registered | undefined;
 export {};

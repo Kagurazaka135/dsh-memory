@@ -22,13 +22,12 @@
  * - **降级**：宿主没有 sessions/schedule/sessionPersistence 服务（如 dsh 0.1.x）时什么都不做，
  *   记忆工具照常可用。
  */
-import type { Context } from '@deepseek-ai/cordis'
 import type { MemoryConfig } from './config.ts'
 import { normalizeDailyTime, normalizeTimeZone } from './config.ts'
 import { localDate } from './organize.ts'
 import { appendLog, resolvePaths } from './store.ts'
 import {
-  serviceOf, type LoggerLike, type PersistenceHandleLike, type ScheduleLike, type ScheduleTaskLike,
+  serviceOf, type ContextLike, type LoggerLike, type PersistenceHandleLike, type ScheduleLike, type ScheduleTaskLike,
   type SessionPersistenceLike, type SessionsLike,
 } from './host.ts'
 import type { YamlValue } from './yaml.ts'
@@ -90,7 +89,7 @@ type MaterializeState = 'created' | 'exists' | 'fallback' | 'failed'
  * 老宿主回退：sessions.create + sessions.flush（只进内存；若宿主另有写盘机制仍可能有效）。
  */
 async function materializeOrganizerSession(
-  ctx: Context,
+  ctx: ContextLike,
   config: MemoryConfig,
   organizerId: string,
 ): Promise<{ state: MaterializeState; detail?: string }> {
@@ -137,7 +136,7 @@ async function materializeOrganizerSession(
 }
 
 /** 幂等注册每日整理任务。可重复调用（重复 = no-op）。 */
-export async function setupNightlyOrganize(ctx: Context, config: MemoryConfig): Promise<SetupResult> {
+export async function setupNightlyOrganize(ctx: ContextLike, config: MemoryConfig): Promise<SetupResult> {
   const sessions = serviceOf<SessionsLike>(ctx, 'sessions')
   const schedule = serviceOf<ScheduleLike>(ctx, 'schedule')
   const logger = serviceOf<LoggerLike>(ctx, 'logger')
@@ -212,7 +211,7 @@ export async function setupNightlyOrganize(ctx: Context, config: MemoryConfig): 
  * 显式停用（`enable_schedule: false`）时清理自己注册的夜间整理任务。
  * 只删本插件自己的任务（会话 + 标题/prompt 标记双重匹配），绝不碰别人的任务。返回删除条数。
  */
-export async function cleanupNightlyOrganize(ctx: Context, config: MemoryConfig): Promise<number> {
+export async function cleanupNightlyOrganize(ctx: ContextLike, config: MemoryConfig): Promise<number> {
   const schedule = serviceOf<ScheduleLike>(ctx, 'schedule')
   const logger = serviceOf<LoggerLike>(ctx, 'logger')
   if (schedule === undefined) return 0
