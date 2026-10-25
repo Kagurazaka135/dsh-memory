@@ -309,7 +309,7 @@ export function registerMemoryTools(ctx: unknown, deps: ToolDeps): void {
     parameters: {
       dry_run: { type: 'boolean', description: '只生成报告、不写任何文件（默认 false）' },
       scan_sessions: { type: 'number', description: '本次最多扫描多少场会话（默认 12）' },
-      reshard: { type: 'boolean', description: '强制重排分片（事实超过阈值时本来就会自动排；这里用于手动触发）' },
+      reshard: { type: 'boolean', description: '重排已有分片（只对已分片的库有效；空库不会凭空造片，首次分片由 shard_threshold 触发）' },
     },
     output: {
       schema: {
