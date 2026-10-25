@@ -11,7 +11,7 @@
  * 唯一允许“覆盖”的是 brief.md 与 candidates.yaml 的当前态（二者可由 facts + 会话重建，
  * 且候选被升格/驳回时带 `status` 标记保留在文件里，不物理删除）。
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { parseYaml, toYaml, type YamlValue } from './yaml.ts'
@@ -41,7 +41,8 @@ export interface CandidateRecord {
   count: number
   source: string[]
   tags: string[]
-  status: 'pending' | 'promoted' | 'rejected'
+  /** merged = 被存量归并吃掉了（记录保留、计数与来源已并入保留者，不删）。 */
+  status: 'pending' | 'promoted' | 'rejected' | 'merged'
   note?: string
 }
 
@@ -52,6 +53,10 @@ export interface MemoryPaths {
   candidates: string
   logDir: string
   seen: string
+  /** 分片目录（`facts/`）；存在且含 .yaml 时启用分片布局。 */
+  factsDir: string
+  /** 分片索引（`facts/_index.yaml`）——**是缓存不是真相**，读不到就从分片文件重建。 */
+  shardIndex: string
 }
 
 /** DSH_HOME 解析：配置 > `$DSH_HOME` > `~/.dsh`（与 dsh-home-paths 同一优先级）。 */
@@ -65,6 +70,7 @@ export function resolveDshHome(configured?: string): string {
 
 export function resolvePaths(config: MemoryConfig): MemoryPaths {
   const root = config.memory_dir?.trim() || join(resolveDshHome(), 'memory')
+  const factsDir = join(root, 'facts')
   return {
     root,
     brief: join(root, 'brief.md'),
@@ -72,6 +78,8 @@ export function resolvePaths(config: MemoryConfig): MemoryPaths {
     candidates: join(root, 'candidates.yaml'),
     logDir: join(root, 'log'),
     seen: join(root, '.sessions.json'),
+    factsDir,
+    shardIndex: join(factsDir, '_index.yaml'),
   }
 }
 
@@ -104,13 +112,72 @@ const FACTS_HEADER = [
   '请勿手写覆盖历史条目 —— 修改事实请用 memory_note（自动追加新版本）。',
 ]
 
-export async function readFacts(paths: MemoryPaths): Promise<FactRecord[]> {
-  const text = await readTextIfExists(paths.facts)
+/** 读单个事实文件（分片或旧单文件走同一条路径）。 */
+async function readFactsFile(path: string): Promise<FactRecord[]> {
+  const text = await readTextIfExists(path)
   if (text === undefined || text.trim() === '') return []
   const parsed = parseYaml(text)
   if (parsed === null) return []
-  if (!Array.isArray(parsed)) throw new Error('dsh-memory: facts.yaml 顶层应为数组（受限 YAML）')
+  if (!Array.isArray(parsed)) throw new Error(`dsh-memory: ${path} 顶层应为数组（受限 YAML）`)
   return parsed.filter(isRecord).map(coerceFact)
+}
+
+export const SHARD_INDEX_FILE = '_index.yaml'
+export const UNSORTED_SHARD = 'unsorted'
+
+/** 分片名白名单：小写字母/数字/短横线，≤32 字符。不合规的名一律回落 unsorted。 */
+export function safeShardName(value: string): string {
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32)
+  return normalized === '' ? UNSORTED_SHARD : normalized
+}
+
+/** 列出已有分片文件名（不含扩展名、不含索引）。没有分片目录时返回空数组。 */
+export async function listShardFiles(paths: MemoryPaths): Promise<string[]> {
+  let entries: string[]
+  try {
+    entries = await readdir(paths.factsDir)
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+  return entries
+    .filter(name => name.endsWith('.yaml') && name !== SHARD_INDEX_FILE)
+    .map(name => name.slice(0, -'.yaml'.length))
+    .sort()
+}
+
+export interface ShardEntry {
+  name: string
+  count: number
+  updated_at: string
+  tags: string[]
+  keywords: string[]
+}
+
+export interface ShardIndex {
+  shards: ShardEntry[]
+  total: number
+  updated_at: string
+}
+
+/** 读 L3 事实：有分片就读分片（合并），否则读旧的单文件 `facts.yaml`。 */
+export async function readFacts(paths: MemoryPaths): Promise<FactRecord[]> {
+  const shardNames = await listShardFiles(paths)
+  if (shardNames.length === 0) return readFactsFile(paths.facts)
+  const all: FactRecord[] = []
+  for (const name of shardNames) all.push(...await readFactsFile(join(paths.factsDir, `${name}.yaml`)))
+  return all
+}
+
+/** 事实 id → 所在分片；无分片布局时返回 undefined。 */
+export async function readShardLayout(paths: MemoryPaths): Promise<Map<string, string> | undefined> {
+  const shardNames = await listShardFiles(paths)
+  if (shardNames.length === 0) return undefined
+  const layout = new Map<string, string>()
+  for (const name of shardNames) {
+    for (const fact of await readFactsFile(join(paths.factsDir, `${name}.yaml`))) layout.set(fact.id, name)
+  }
+  return layout
 }
 
 function isRecord(value: unknown): value is { [key: string]: YamlValue } {
@@ -162,8 +229,212 @@ export function factToYaml(record: FactRecord): YamlValue {
   }
 }
 
+/**
+ * 写 L3 事实。
+ *
+ * 分片布局下按已有归属分组，**新事实进 unsorted**（下次整理再归档）；
+ * 一律不删分片文件——变空的分片写成只剩表头的空文件，避免读到陈旧内容。
+ */
 export async function writeFacts(paths: MemoryPaths, facts: readonly FactRecord[]): Promise<void> {
-  await writeFileAtomic(paths.facts, toYaml(facts.map(factToYaml), FACTS_HEADER))
+  const shardNames = await listShardFiles(paths)
+  if (shardNames.length === 0) {
+    await writeFileAtomic(paths.facts, toYaml(facts.map(factToYaml), FACTS_HEADER))
+    return
+  }
+  const layout = await readShardLayout(paths) ?? new Map<string, string>()
+  const groups = new Map<string, FactRecord[]>()
+  for (const fact of facts) {
+    const shard = layout.get(fact.id) ?? UNSORTED_SHARD
+    const list = groups.get(shard)
+    if (list === undefined) groups.set(shard, [fact])
+    else list.push(fact)
+  }
+  await writeShardGroups(paths, groups, shardNames)
+}
+
+// ---------- 分片（L3 事实多了以后按主题拆文件） ----------
+
+const shardHeader = (name: string): string[] => [
+  `dsh-memory · L3 永久事实分片「${name}」（版本化，只追加）`,
+  '分片只是存放位置，不是事实身份——id 全局唯一，跨分片不重复。',
+  '请勿手写覆盖历史条目 —— 修改事实请用 memory_note（自动追加新版本）。',
+]
+
+const SHARD_INDEX_HEADER = [
+  'dsh-memory · 分片索引（缓存，可从分片文件重建；删掉索引不会丢任何事实）',
+  'shards[].keywords 只用于检索时挑分片，不是事实内容。',
+]
+
+export function localDate(now = new Date()): string {
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+}
+
+function shardTags(list: readonly FactRecord[]): string[] {
+  const out: string[] = []
+  for (const fact of list) for (const tag of fact.tags) if (!out.includes(tag)) out.push(tag)
+  return out.slice(0, 20)
+}
+
+/** 从事实主题里取几个词当分片关键词；只影响"要不要读这个分片"，漏了不影响正确性。 */
+function shardKeywords(list: readonly FactRecord[], limit = 12): string[] {
+  const out: string[] = []
+  for (const fact of list) {
+    for (const word of fact.fact.split(/[\s,，、;；:：()（）[\]/|]+/)) {
+      const trimmed = word.trim()
+      if (trimmed.length < 2 || out.includes(trimmed)) continue
+      out.push(trimmed)
+      if (out.length >= limit) return out
+    }
+  }
+  return out
+}
+
+function buildShardEntry(name: string, list: readonly FactRecord[], date: string): ShardEntry {
+  return {
+    name,
+    count: list.length,
+    updated_at: list.map(fact => fact.updated_at).filter(Boolean).sort().at(-1) || date,
+    tags: shardTags(list),
+    keywords: shardKeywords(list),
+  }
+}
+
+function indexToYaml(index: ShardIndex): YamlValue {
+  return {
+    updated_at: index.updated_at,
+    total: index.total,
+    shards: index.shards.map(entry => ({
+      name: entry.name,
+      count: entry.count,
+      updated_at: entry.updated_at,
+      tags: entry.tags,
+      keywords: entry.keywords,
+    })),
+  }
+}
+
+/** 读分片索引；读不到/格式不对都返回 undefined（调用方回落"全读"）。 */
+export async function readShardIndex(paths: MemoryPaths): Promise<ShardIndex | undefined> {
+  const text = await readTextIfExists(paths.shardIndex)
+  if (text === undefined || text.trim() === '') return undefined
+  const parsed = parseYaml(text)
+  if (parsed === null || !isRecord(parsed)) return undefined
+  const rawShards = parsed.shards
+  if (!Array.isArray(rawShards)) return undefined
+  const shards = rawShards.filter(isRecord).map((raw): ShardEntry => ({
+    name: asString(raw.name),
+    count: typeof raw.count === 'number' ? raw.count : 0,
+    updated_at: asString(raw.updated_at),
+    tags: asStringArray(raw.tags),
+    keywords: asStringArray(raw.keywords),
+  })).filter(entry => entry.name !== '')
+  return {
+    shards,
+    total: typeof parsed.total === 'number' ? parsed.total : shards.reduce((sum, entry) => sum + entry.count, 0),
+    updated_at: asString(parsed.updated_at),
+  }
+}
+
+/**
+ * 写分片 + 重建索引。
+ *
+ * `existingNames` 里的分片即使这次没有事实也会写一个只有表头的空文件——
+ * 宁可留个空壳，也不要让旧的 .yaml 留在盘上被下次读到。
+ */
+export async function writeShardGroups(
+  paths: MemoryPaths,
+  groups: ReadonlyMap<string, readonly FactRecord[]>,
+  existingNames: readonly string[] = [],
+): Promise<ShardIndex> {
+  const date = localDate()
+  // 首次分片：把旧的单文件挪进 archive（移动不是删除，事实一条不少）
+  if (existingNames.length === 0) await archiveLegacyFacts(paths, date)
+
+  const names = [...new Set([...existingNames, ...groups.keys()])].sort()
+  const shards: ShardEntry[] = []
+  for (const name of names) {
+    const list = groups.get(name) ?? []
+    await writeFileAtomic(join(paths.factsDir, `${name}.yaml`), toYaml(list.map(factToYaml), shardHeader(name)))
+    // 0 条的分片改名叫"空壳"：文件留着（不删）但**不进索引**——
+    // 免得它参与检索挑选、还把尾注里的"跳过 N 个"数字带漂。
+    if (list.length > 0) shards.push(buildShardEntry(name, list, date))
+  }
+  shards.sort((a, b) => {
+    if (a.name === UNSORTED_SHARD) return 1
+    if (b.name === UNSORTED_SHARD) return -1
+    return a.name.localeCompare(b.name)
+  })
+  const index: ShardIndex = {
+    shards,
+    total: shards.reduce((sum, entry) => sum + entry.count, 0),
+    updated_at: date,
+  }
+  await writeFileAtomic(paths.shardIndex, toYaml(indexToYaml(index), SHARD_INDEX_HEADER))
+  return index
+}
+
+/** 旧的单文件挪进 `.archive/`，不删。 */
+async function archiveLegacyFacts(paths: MemoryPaths, date: string): Promise<void> {
+  try {
+    await mkdir(join(paths.root, '.archive'), { recursive: true })
+    await rename(paths.facts, join(paths.root, '.archive', `facts-${date}.yaml`))
+  } catch (error: unknown) {
+    // 没有旧文件（首次就是分片）或已被移走：忽略
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+}
+
+export interface ShardQueryResult {
+  facts: FactRecord[]
+  sharded: boolean
+  /** 实际读了的分片；非分片布局为空。 */
+  scanned: string[]
+  /** 索引判定不必读而跳过的分片。 */
+  skipped: string[]
+}
+
+/**
+ * 按索引挑分片读事实。
+ *
+ * **索引只用来缩小范围，判不准就全读** —— 漏读是错，多读只是慢。
+ */
+export async function readFactsForQuery(
+  paths: MemoryPaths,
+  query: string,
+  tags: readonly string[] = [],
+): Promise<ShardQueryResult> {
+  const shardNames = await listShardFiles(paths)
+  if (shardNames.length === 0) {
+    return { facts: await readFactsFile(paths.facts), sharded: false, scanned: [], skipped: [] }
+  }
+  const readAll = async (): Promise<FactRecord[]> => {
+    const all: FactRecord[] = []
+    for (const name of shardNames) all.push(...await readFactsFile(join(paths.factsDir, `${name}.yaml`)))
+    return all
+  }
+  const index = await readShardIndex(paths)
+  const wanted = tags.map(tag => tag.trim().toLowerCase()).filter(Boolean)
+  const needle = query.trim().toLowerCase()
+  if (index === undefined || (wanted.length === 0 && needle === '')) {
+    return { facts: await readAll(), sharded: true, scanned: shardNames, skipped: [] }
+  }
+  const words = needle.split(/\s+/).filter(word => word !== '')
+  const selected = index.shards.filter(entry => {
+    if (wanted.length > 0 && entry.tags.some(tag => wanted.includes(tag.toLowerCase()))) return true
+    if (words.length === 0) return false
+    const haystack = [entry.name, ...entry.tags, ...entry.keywords].join(' ').toLowerCase()
+    return words.some(word => haystack.includes(word))
+  })
+  // 一片都没挑中 → 判不准，全读（宁可慢，不许漏）
+  const target = selected.length > 0 ? selected.map(entry => entry.name) : shardNames
+  const facts: FactRecord[] = []
+  for (const name of target) {
+    const path = join(paths.factsDir, `${name}.yaml`)
+    facts.push(...await readFactsFile(path))
+  }
+  return { facts, sharded: true, scanned: target, skipped: shardNames.filter(name => !target.includes(name)) }
 }
 
 let factCounter = 0
@@ -237,8 +508,8 @@ function mergeUnique(base: string[], added: string[]): string[] {
 // ---------- 候选（L2） ----------
 
 const CANDIDATES_HEADER = [
-  'dsh-memory · L2 待升格候选（只追加，升格/驳回只改 status 不删除）',
-  'status: pending 待人工确认 | promoted 已升格 | rejected 已驳回（仍保留可见）',
+  'dsh-memory · L2 待升格候选（只追加，升格/驳回/归并只改 status 不删除）',
+  'status: pending 待确认 | promoted 已升格 | rejected 已驳回 | merged 已并入同义条目',
 ]
 
 export async function readCandidates(paths: MemoryPaths): Promise<CandidateRecord[]> {
@@ -250,7 +521,7 @@ export async function readCandidates(paths: MemoryPaths): Promise<CandidateRecor
   return parsed.filter(isRecord).map((raw): CandidateRecord => {
     const statusText = asString(raw.status, 'pending')
     const status: CandidateRecord['status'] =
-      statusText === 'promoted' || statusText === 'rejected' ? statusText : 'pending'
+      statusText === 'promoted' || statusText === 'rejected' || statusText === 'merged' ? statusText : 'pending'
     return {
       id: asString(raw.id),
       fact: asString(raw.fact),
@@ -279,6 +550,44 @@ export function candidateToYaml(record: CandidateRecord): YamlValue {
   }
 }
 
+/**
+ * 存量归并：把**已经分裂**的同义 pending 候选收拢成一条。
+ *
+ * `candidateKey` 只在新增路径起作用，所以先分裂的存量会一直躺着——
+ * 防增量不清存量等于半截工程（2026-10-25 实测：两条同义候选连跑 3 次整理没人管）。
+ *
+ * **只追加铁律**：多余的份不删，标 `merged` 并在 note 里记去向；
+ * 计数/来源/标签并入保留的那条（最早出现的），所以信息一条不丢。
+ *
+ * @returns 实际归并掉几条（0 = 没有重复）
+ */
+export function mergeDuplicateCandidates(records: CandidateRecord[], date: string): number {
+  const keep = new Map<string, CandidateRecord>()
+  let merged = 0
+  for (const record of records) {
+    if (record.status !== 'pending') continue
+    const key = candidateKey(record.fact)
+    const head = keep.get(key)
+    if (head === undefined) {
+      keep.set(key, record)
+      continue
+    }
+    head.count += record.count
+    head.source = mergeUnique(head.source, record.source)
+    head.tags = mergeUnique(head.tags, record.tags)
+    if (record.first_seen !== '' && record.first_seen < head.first_seen) head.first_seen = record.first_seen
+    if (record.last_seen > head.last_seen) head.last_seen = record.last_seen
+    head.note = head.note ?? record.note
+    head.last_seen = date > head.last_seen ? date : head.last_seen
+
+    record.status = 'merged'
+    record.count = 0
+    record.note = `已并入 ${head.id}（同义归并 ${date}）`
+    merged += 1
+  }
+  return merged
+}
+
 export async function writeCandidates(paths: MemoryPaths, records: readonly CandidateRecord[]): Promise<void> {
   await writeFileAtomic(paths.candidates, toYaml(records.map(candidateToYaml), CANDIDATES_HEADER))
 }
@@ -291,12 +600,29 @@ export function nextCandidateId(now = new Date()): string {
 }
 
 /** 记录一条候选：同条目（fact 去空白后相同）重复出现 → count+1、刷新 last_seen。 */
+/**
+ * 候选文本的比对口径：归一化空白**再剥掉摘录腔尾巴**。
+ *
+ * 模型很爱把列表格式当正文抄下来——实测（2026-10-25）同一条待办被存成
+ * 「…需在模型通道恢复后重试。」和「…需在模型通道恢复后重试。（出现 1 次）」两条。
+ * prompt 里写了"原样照抄"也拦不住，所以这里做最后一道兜底。
+ *
+ * 只剥**明确的元信息后缀**，不做模糊匹配：宁可偶尔多存一条，不能误合并丢线索。
+ */
+export function candidateKey(value: string): string {
+  return normalizeText(
+    value
+      .replace(/\s*[（(]\s*出现\s*\d+\s*次\s*[）)]\s*$/u, '')
+      .replace(/\s*[（(]\s*appears?\s+\d+\s+times?\s*[）)]\s*$/iu, ''),
+  )
+}
+
 export function addCandidate(
   records: CandidateRecord[],
   input: { fact: string; date: string; source?: string[]; tags?: string[]; note?: string },
 ): CandidateRecord {
-  const normalized = normalizeText(input.fact)
-  const existing = records.find(item => normalizeText(item.fact) === normalized)
+  const normalized = candidateKey(input.fact)
+  const existing = records.find(item => candidateKey(item.fact) === normalized)
   if (existing !== undefined) {
     existing.count += 1
     existing.last_seen = input.date
@@ -327,9 +653,23 @@ const BRIEF_HEADER = [
   '由夜间整理 / memory_organize 更新。',
 ]
 
+/**
+ * 最近一次已知的简报正文（同步读）。
+ *
+ * system prompt 的 `context()` 提供者**只能同步**，所以这里缓存一份：
+ * 读盘时刷新、写盘时也刷新。缓存没热起来时返回 undefined，下一轮装配就有值了。
+ */
+let briefCache: string | undefined
+
+export function cachedBrief(): string | undefined {
+  return briefCache
+}
+
 export async function readBrief(paths: MemoryPaths): Promise<string | undefined> {
   const text = await readTextIfExists(paths.brief)
-  return text === undefined || text.trim() === '' ? undefined : text
+  const value = text === undefined || text.trim() === '' ? undefined : text
+  briefCache = value
+  return value
 }
 
 /** 生成新的摘要正文（当前态）。旧版由 archiveBrief() 归档到 log/，内容不丢。 */
@@ -356,6 +696,7 @@ export async function archiveBrief(paths: MemoryPaths, date: string, previous: s
 
 export async function writeBrief(paths: MemoryPaths, content: string): Promise<void> {
   await writeFileAtomic(paths.brief, content)
+  briefCache = content
 }
 
 // ---------- 整理日志（append-only NDJSON） ----------

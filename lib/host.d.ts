@@ -122,11 +122,82 @@ export interface LoggerLike {
     warn(message: string): void;
     debug?(message: string): void;
 }
+/** dsh `llm.stream()` 的返回块（只用到文本/推理增量与终止原因）。 */
+export type LlmChunkLike = {
+    type: 'text-delta';
+    text: string;
+} | {
+    type: 'reasoning-delta';
+    text: string;
+} | {
+    type: 'finish';
+    reason: {
+        kind: string;
+        failure?: {
+            message?: string;
+            code?: string;
+        };
+    };
+} | {
+    type: string;
+    [key: string]: unknown;
+};
+/**
+ * 宿主契约里的内容块。**`content` 必须是块数组，不能是字符串** ——
+ * 传字符串在入口不会报错，会一路滑到适配器的 `blocks.entries()` 才抛错。
+ */
+export interface TextBlockLike {
+    type: 'text';
+    text: string;
+}
+/** dsh 的模型调用服务（`ctx.llm`）。走宿主配好的 provider，不自己拼 HTTP。 */
+export interface LlmRuntimeLike {
+    stream(options: {
+        provider: string;
+        model: string;
+        messages: Array<{
+            role: 'user' | 'assistant' | 'system';
+            content: readonly TextBlockLike[];
+        }>;
+        system?: string;
+        maxTokens?: number;
+        temperature?: number;
+        signal?: AbortSignal;
+    }): AsyncIterable<LlmChunkLike>;
+}
+/** 宿主当前默认模型选择（`ctx.agentDefaultModel.currentSelection()`）。 */
+export interface ModelSelectionLike {
+    provider: string;
+    model: string;
+}
+export interface AgentDefaultModelLike {
+    currentSelection(): ModelSelectionLike;
+}
+/** system prompt 的一个常驻段落（dsh `systemPrompt.section()` 的入参）。 */
+export interface PromptSectionLike {
+    name: string;
+    order: number;
+    text: string | ((context: unknown) => string);
+}
+/** system prompt 的一段动态快照（dsh `systemPrompt.context()` 的入参；`text` 只能同步）。 */
+export interface PromptContextLike {
+    name: string;
+    order: number;
+    text: string | ((context: unknown) => string);
+}
+/** 系统提示服务（dsh ≥0.1.x）。只用到 section / context，其余按 unknown。 */
+export interface SystemPromptLike {
+    section(section: PromptSectionLike): unknown;
+    context(context: PromptContextLike): unknown;
+}
 /** 一次 apply 里用到的宿主服务集合（缺谁谁 undefined）。 */
 export interface HostBundle {
     sessions?: SessionsLike;
     schedule?: ScheduleLike;
     sessionQuery?: SessionQueryLike;
+    systemPrompt?: SystemPromptLike;
+    llm?: LlmRuntimeLike;
+    agentDefaultModel?: AgentDefaultModelLike;
     logger?: LoggerLike;
 }
 /**

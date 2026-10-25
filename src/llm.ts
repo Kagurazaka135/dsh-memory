@@ -1,103 +1,99 @@
 /**
- * 整理专用 LLM 客户端 —— 走**本地凭证代理（broker）**。
+ * 整理专用模型调用 —— 走**宿主的 `ctx.llm` 服务**。
  *
- * 铁律：代码里只有 `http://127.0.0.1:9999` 和假 key `local-broker`；
- * 真钥匙由 broker 按模型名注入，本文件（及整个仓库）不可能出现任何真 key。
- *
- * broker 不可达 / 超时 / 返回不可解析 → 抛错，由调用方决定"宁可不写记忆"。
+ * 为什么不用自己拼 HTTP：dsh 自己就要靠模型上班，provider / 地址 / 真钥匙
+ * 全在宿主的模型设置里（PC 上 profile 指向本地 broker，手机上是 App 里配的
+ * 那一套）。插件跟着宿主走，两端都不用额外配置，也不会有"真 key 进仓库"的问题。
  */
+import type { LlmRuntimeLike, ModelSelectionLike } from './host.ts'
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
 }
 
-export interface BrokerOptions {
-  baseUrl: string
-  model: string
-  timeoutMs?: number
-  /** 输出上限；推理模型的 reasoning token 也计入，给足余量（默认 8192）。 */
+export interface OrganizerModel {
+  llm: LlmRuntimeLike
+  /** 没显式指定时用宿主当前的默认选择。 */
+  fallback?: ModelSelectionLike
+  /** 配置里显式指定的 provider / model（可以只给 model）。 */
+  provider?: string
+  model?: string
   maxTokens?: number
+  timeoutMs?: number
 }
 
-export const BROKER_FAKE_KEY = 'local-broker'
-
-export async function chat(options: BrokerOptions, messages: readonly ChatMessage[], signal?: AbortSignal): Promise<string> {
-  const url = `${options.baseUrl.replace(/\/+$/, '')}/v1/chat/completions`
+/** 一次非流式调用：把 chunk 流攒成完整文本。 */
+export async function chat(options: OrganizerModel, messages: readonly ChatMessage[], signal?: AbortSignal): Promise<string> {
+  const selection = resolveSelection(options)
   const timeoutMs = options.timeoutMs ?? 300_000
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(new Error('dsh-memory: broker 请求超时')), timeoutMs)
+  const timer = setTimeout(
+    () => controller.abort(new Error('dsh-memory: 模型调用超时')),
+    timeoutMs,
+  )
   const fused = signal === undefined ? controller.signal : AbortSignal.any([signal, controller.signal])
-  let response: Response
+
+  let text = ''
+  let reasoning = ''
+  let failure: string | undefined
   try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${BROKER_FAKE_KEY}`,
-      },
-      body: JSON.stringify({
-        model: options.model,
-        messages,
-        temperature: 0.2,
-        max_tokens: options.maxTokens ?? 8192,
-        stream: false,
-      }),
+    const stream = options.llm.stream({
+      provider: selection.provider,
+      model: selection.model,
+      // 宿主契约：RequestMessage.content 是 **ContentBlock 数组**，不是字符串
+      // （`UserMessage['content']` → `MessageBase.content: readonly ContentBlock[]`）。
+      // 传字符串不会在入口报错——上游 `for…of` 迭代出字符、`block.type` 恒 undefined，
+      // 一路滑到适配器的 `blocks.entries()` 才抛 TypeError，外层只剩
+      // "DeepSeek Messages transport failed"，完全看不出是形状问题。别改回字符串。
+      messages: messages.map(message => ({
+        role: message.role,
+        content: [{ type: 'text' as const, text: message.content }],
+      })),
+      temperature: 0.2,
+      maxTokens: options.maxTokens ?? 8192,
       signal: fused,
     })
+    for await (const chunk of stream) {
+      if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+        text += chunk.text
+      } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+        // 推理模型的 reasoning 先于 content 生成：content 空但 reasoning 带完整
+        // JSON 时靠它兜底（extractJsonObject 会抠出来）。
+        reasoning += chunk.text
+      } else if (chunk.type === 'finish') {
+        const reason = chunk.reason as { kind?: string; failure?: { message?: string; code?: string } } | undefined
+        if (reason?.kind === 'error' || reason?.kind === 'aborted') {
+          failure = reason.failure?.message ?? reason.failure?.code ?? reason.kind
+        } else if (reason?.kind === 'max-tokens' && text.trim() === '' && reasoning.trim() === '') {
+          failure = 'token 预算被推理过程耗尽（finish_reason=max-tokens）'
+        }
+      }
+    }
   } catch (error: unknown) {
-    throw new Error(`dsh-memory: 无法连接本地 broker（${options.baseUrl}）：${error instanceof Error ? error.message : String(error)}`)
+    throw new Error(`dsh-memory: 模型调用失败（${selection.provider}/${selection.model}）：${error instanceof Error ? error.message : String(error)}`)
   } finally {
     clearTimeout(timer)
   }
-  if (!response.ok) {
-    const body = await response.text().catch(() => '')
-    throw new Error(`dsh-memory: broker 返回 HTTP ${response.status}${body ? `：${body.slice(0, 300)}` : ''}`)
-  }
-  const text = await response.text()
-  return extractContent(text)
-}
 
-/**
- * 从 OpenAI 兼容响应里取第一个 choice 的文本。
- * 推理模型（如 deepseek-flash）的 `reasoning_content` 会先于 `content` 生成：
- * content 为空但 reasoning 里带完整 JSON 时回退到 reasoning（extractJsonObject 会抠出来），
- * 两者都空才报错 —— 错误里带上 finish_reason 便于定位（如 length = token 预算耗尽）。
- */
-export function extractContent(raw: string): string {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    throw new Error(`dsh-memory: broker 响应不是 JSON（前 120 字：${raw.slice(0, 120)}）`)
+  if (failure !== undefined) {
+    throw new Error(`dsh-memory: 模型调用失败（${selection.provider}/${selection.model}）：${failure}`)
   }
-  const choices = (parsed as { choices?: unknown }).choices
-  if (!Array.isArray(choices) || choices.length === 0) {
-    throw new Error('dsh-memory: broker 响应没有 choices')
-  }
-  const choice = choices[0] as { message?: { content?: unknown; reasoning_content?: unknown }; finish_reason?: unknown }
-  const finish = typeof choice.finish_reason === 'string' ? choice.finish_reason : 'unknown'
-  const content = choice.message?.content
-  const text = blocksToText(content)
   if (text.trim() !== '') return text
-  const reasoning = blocksToText(choice.message?.reasoning_content)
   if (reasoning.trim() !== '') return reasoning
-  throw new Error(`dsh-memory: broker 响应 content 为空（finish_reason=${finish}；可能是 token 预算被 reasoning 耗尽）`)
+  throw new Error(`dsh-memory: 模型返回空内容（${selection.provider}/${selection.model}）`)
 }
 
-function blocksToText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    const parts: string[] = []
-    for (const block of content) {
-      if (typeof block === 'string') parts.push(block)
-      else if (block !== null && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string') {
-        parts.push((block as { text: string }).text)
-      }
-    }
-    return parts.join('')
+/** 显式配置优先，其次宿主当前默认选择。两者都没有就是宿主没配模型。 */
+export function resolveSelection(options: OrganizerModel): ModelSelectionLike {
+  const provider = options.provider?.trim() || options.fallback?.provider?.trim()
+  const model = options.model?.trim() || options.fallback?.model?.trim()
+  if (!provider || !model) {
+    throw new Error(
+      'dsh-memory: 宿主没有可用的默认模型（agentDefaultModel 缺失），也没在插件配置里指定 organizer_provider / organizer_model',
+    )
   }
-  return ''
+  return { provider, model }
 }
 
 /** 从模型输出里抠出第一个 JSON 对象（容忍 ```json 代码栅栏与前后废话）。 */

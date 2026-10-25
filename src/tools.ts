@@ -12,8 +12,8 @@ import { defineTool, type ToolRunContext } from './define-tool.ts'
 import type { MemoryConfig } from './config.ts'
 import { localDate, runOrganize } from './organize.ts'
 import {
-  addCandidate, ensureDirs, readBrief, readCandidates, readFacts, resolvePaths, upsertFact,
-  writeCandidates, writeFacts, type MemoryPaths,
+  addCandidate, candidateKey, ensureDirs, readBrief, readCandidates, readFacts, readFactsForQuery, resolvePaths,
+  upsertFact, writeCandidates, writeFacts, type FactRecord, type MemoryPaths,
 } from './store.ts'
 import { hostBundle } from './host.ts'
 
@@ -33,6 +33,13 @@ function callSessionId(exec: ToolRunContext): string | undefined {
 
 function today(): string {
   return localDate()
+}
+
+/** 命中里含"具体名字"（路径/文件名/端口/IP）时提醒核验——那类内容最容易过期。 */
+function looksLikeSpecificName(hits: readonly FactRecord[]): boolean {
+  const specific = /[/\\]|\.(ts|js|mjs|json|yaml|yml|md|py|toml|ini|cfg|sh)\b|:\d{2,5}\b|\b\d{1,3}(?:\.\d{1,3}){3}\b/
+  return hits.some(fact => specific.test(fact.fact)
+    || fact.history.some(version => specific.test(version.value)))
 }
 
 const TOOL_NAMES = {
@@ -92,7 +99,7 @@ export function registerMemoryTools(ctx: unknown, deps: ToolDeps): void {
   tools.register(defineTool({
     name: TOOL_NAMES.recall,
     description:
-      '检索 L3 永久事实（按关键词匹配 fact 与各版本值，或按 tags 过滤），返回命中事实的完整版本历史。想知道"某件稳定事实现在是什么/以前是什么"时调它。',
+      '检索 L3 永久事实（按关键词匹配 fact 与各版本值，或按 tags 过滤），返回命中事实的完整版本历史。想知道"某件稳定事实现在是什么/以前是什么"时调它。注意：命中的内容是**写入那一刻的断言**——涉及文件名/路径/配置值时，行动前先核验当前状态，别把记忆当现值用。',
     parameters: {
       query: { type: 'string', description: '关键词（不区分大小写，匹配主题与历史值；留空则只按 tags 过滤）' },
       tags: { type: 'array', items: { type: 'string' }, description: '标签过滤（命中任一标签即算；可与 query 同时给）' },
@@ -110,18 +117,31 @@ export function registerMemoryTools(ctx: unknown, deps: ToolDeps): void {
       render: (_args, value) => [{ type: 'text', text: value.message }],
     },
     async execute(args: { query?: string; tags?: string[]; limit?: number }) {
-      const facts = await readFacts(deps.paths)
-      const needle = (args.query ?? '').trim().toLowerCase()
+      const query = (args.query ?? '').trim()
+      const needle = query.toLowerCase()
       const tagFilter = (args.tags ?? []).map(item => item.trim()).filter(Boolean)
       const limit = Math.max(1, Math.min(args.limit ?? 20, 100))
-      const hits = facts.filter(fact => {
+      const loaded = await readFactsForQuery(deps.paths, query, tagFilter)
+      const hits = loaded.facts.filter(fact => {
         if (tagFilter.length > 0 && !tagFilter.some(tag => fact.tags.includes(tag))) return false
         if (needle === '') return true
         const haystack = [fact.fact, ...fact.history.map(v => v.value)].join('\n').toLowerCase()
         return haystack.includes(needle)
       }).slice(0, limit)
       if (hits.length === 0) {
-        return { ok: true, count: 0, message: `没有命中（共 ${facts.length} 条 L3 事实）。换个关键词，或用 memory_brief 看摘要。` }
+        return {
+          ok: true, count: 0,
+          message: [
+            `没有命中${query === '' ? '' : `「${query}」`}（共 ${loaded.facts.length} 条 L3 事实）。`,
+            '',
+            '**0 命中 ≠ 从未记录**——也可能只是措辞不同。别就此下"没记过"的结论，按顺序再试：',
+            '1. 换**更少、更独特**的词（「postgres 5433」比「数据库连接配置」容易命中）；',
+            '2. 只按标签查：`memory_recall { "tags": ["config"] }`，或留空 query 浏览全部；',
+            '3. 用 `memory_brief` 看当前摘要（可能概括成了别的说法）。',
+            '',
+            '（记忆是写入那一刻的断言；命中后涉及路径/文件名/配置值，行动前先核验当前状态。）',
+          ].join('\n'),
+        }
       }
       const body = hits.map(fact => {
         const lines = [`### [${fact.id}] ${fact.fact}`]
@@ -134,7 +154,13 @@ export function registerMemoryTools(ctx: unknown, deps: ToolDeps): void {
         if (fact.tags.length > 0) lines.push(`- tags: ${fact.tags.join(', ')}`)
         return lines.join('\n')
       })
-      return { ok: true, count: hits.length, message: body.join('\n\n') }
+      const footers: string[] = []
+      if (looksLikeSpecificName(hits)) footers.push('⚠️ 上述内容含具体名称/路径/配置值——那是写入时的断言，用前先核验当前状态。')
+      if (loaded.skipped.length > 0) footers.push(`（按分片索引只读了 ${loaded.scanned.join('/')}，跳过 ${loaded.skipped.length} 个分片）`)
+      return {
+        ok: true, count: hits.length,
+        message: footers.length > 0 ? `${body.join('\n\n')}\n\n---\n${footers.join('\n')}` : body.join('\n\n'),
+      }
     },
   }))
 
@@ -244,11 +270,11 @@ export function registerMemoryTools(ctx: unknown, deps: ToolDeps): void {
     async execute(args: { id?: string; fact?: string; value?: string; tags?: string[] }) {
       await ensureDirs(deps.paths)
       const [facts, candidates] = await Promise.all([readFacts(deps.paths), readCandidates(deps.paths)])
-      const normalized = (text: string) => text.trim().replace(/\s+/g, ' ')
       let target = args.id?.trim() ? candidates.find(item => item.id === args.id?.trim()) : undefined
       if (target === undefined && args.fact?.trim()) {
-        const needle = normalized(args.fact)
-        target = candidates.find(item => normalized(item.fact) === needle)
+        // 与 addCandidate 同一口径：剥掉摘录腔尾巴再比，否则带「（出现 N 次）」的那条找不到
+        const needle = candidateKey(args.fact)
+        target = candidates.find(item => candidateKey(item.fact) === needle)
       }
       if (target === undefined) {
         return { ok: false, message: '没找到这条候选（用 id 或与候选完全一致的文本指定；候选列表在 candidates.yaml）。' }
@@ -283,6 +309,7 @@ export function registerMemoryTools(ctx: unknown, deps: ToolDeps): void {
     parameters: {
       dry_run: { type: 'boolean', description: '只生成报告、不写任何文件（默认 false）' },
       scan_sessions: { type: 'number', description: '本次最多扫描多少场会话（默认 12）' },
+      reshard: { type: 'boolean', description: '强制重排分片（事实超过阈值时本来就会自动排；这里用于手动触发）' },
     },
     output: {
       schema: {
@@ -295,18 +322,30 @@ export function registerMemoryTools(ctx: unknown, deps: ToolDeps): void {
       },
       render: (_args, value) => [{ type: 'text', text: value.message }],
     },
-    async execute(args: { dry_run?: boolean; scan_sessions?: number }, exec: ToolRunContext) {
+    async execute(args: { dry_run?: boolean; scan_sessions?: number; reshard?: boolean }, exec: ToolRunContext) {
       const dryRun = args.dry_run === true
       const config: MemoryConfig = {
         ...deps.config,
         ...(args.scan_sessions !== undefined ? { scan_sessions: args.scan_sessions } : {}),
       }
       const host = hostBundle(deps.ctx)
+      const sessionId = callSessionId(exec)
+      if (host.llm === undefined) {
+        return { ok: false, dry_run: dryRun, message: '宿主没有 llm 服务，无法整理记忆（工具读写仍可用）。' }
+      }
       const result = await runOrganize({
         config,
+        llm: {
+          llm: host.llm,
+          ...(host.agentDefaultModel ? { fallback: host.agentDefaultModel.currentSelection() } : {}),
+          ...(deps.config.organizer_provider ? { provider: deps.config.organizer_provider } : {}),
+          ...(deps.config.organizer_model ? { model: deps.config.organizer_model } : {}),
+        },
         ...(host.sessionQuery ? { sessionQuery: host.sessionQuery } : {}),
+        ...(sessionId ? { skipSessionId: sessionId } : {}),
         signal: exec.signal,
         dryRun,
+        ...(args.reshard === true ? { forceReshard: true } : {}),
       })
       const lines: string[] = []
       if (!result.ok) {
@@ -319,6 +358,9 @@ export function registerMemoryTools(ctx: unknown, deps: ToolDeps): void {
         lines.push(`- L3 追加版本 ${result.factsVersioned.length} 条${result.factsVersioned.length ? `（${result.factsVersioned.join(', ')}）` : ''}`)
         lines.push(`- L2 新候选 ${result.candidatesAdded} 条`)
         lines.push(`- L4 摘要 ${result.briefUpdated ? '已更新（旧版归档在 log/）' : '无变化'}`)
+        if (result.shards !== undefined && result.shards.length > 0) {
+          lines.push(`- 分片：${result.shards.length} 个文件（${result.shards.map(item => `${item.name} ${item.count}`).join(' · ')}）`)
+        }
         if (result.summary) lines.push(`- 说明：${result.summary}`)
         if (!dryRun) lines.push(`- 日志：${result.logPath}`)
       }

@@ -3,9 +3,12 @@
 export interface MemoryConfig {
   /** 记忆目录；默认 `$DSH_HOME/memory`（DSH_HOME 缺省 `~/.dsh`）。 */
   memory_dir?: string
-  /** 整理用模型走本地 broker 的地址（真钥匙由 broker 注入，代码里只有假 key）。 */
-  broker_url?: string
-  /** 整理用模型名（broker 按模型名选上游）。 */
+  /**
+   * 整理用的模型：provider 与 model 都留空 = **跟随宿主当前默认模型**
+   * （`ctx.agentDefaultModel.currentSelection()`）。
+   * 想指定：两个都要给（provider 是宿主的 provider 路由名，如 `deepseek-official`）。
+   */
+  organizer_provider?: string
   organizer_model?: string
   /** 每日整理时间 `HH:MM` 或 `HH:MM:SS`（本地时区），默认 04:00:00；内部统一归一到秒级。 */
   daily_time?: string
@@ -17,13 +20,17 @@ export interface MemoryConfig {
   enable_schedule?: boolean
   /** 夜间最多扫描多少场会话，默认 12（上限 40）。 */
   scan_sessions?: number
+  /** 事实超过多少条时自动分片，默认 80；设 0 或负数可关闭自动分片。 */
+  shard_threshold?: number
+  /** 是否允许分片（false = 永远用单个 facts.yaml）。 */
+  enable_shard?: boolean
 }
 
 export const DEFAULT_CONFIG: MemoryConfig = {
-  broker_url: 'http://127.0.0.1:9999',
-  organizer_model: 'deepseek-flash',
   daily_time: '04:00:00',
   scan_sessions: 12,
+  shard_threshold: 80,
+  enable_shard: true,
 }
 
 /**

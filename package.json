@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory",
-  "version": "0.1.2",
+  "version": "0.2.4",
   "description": "Layered memory for DeepSeek Harness (DSH): versioned L3 facts (append-only), L4 startup brief, nightly organization via native schedule. Zero runtime dependencies; PC + Android.",
   "type": "module",
   "main": "lib/index.js",
