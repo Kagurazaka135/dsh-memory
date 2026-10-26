@@ -10,8 +10,10 @@ node_modules/
 *-交付-*.md
 问题清单.md
 审计-*.md
+# TODO.md 公开；docs/ 只放行 field-notes（verification 里有本机配置细节，暂不公开）
 TODO.md
-docs/
+docs/*
+!docs/field-notes/
 
 # P-6 行为等价验证的临时工作区（旧 lib 副本 + 对比脚本，不提交）
 .equiv/
